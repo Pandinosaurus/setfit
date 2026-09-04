@@ -2,27 +2,17 @@ import json
 import os
 import tempfile
 import warnings
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
-
-
-# For Python 3.7 compatibility
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
+from typing import Dict, List, Literal, Optional, Set, Tuple, Union
 
 import joblib
 import numpy as np
-import requests
 import torch
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
-from huggingface_hub.utils import validate_hf_hub_args
+from huggingface_hub import ModelHubMixin, hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError, HfHubHTTPError, validate_hf_hub_args
 from packaging.version import Version, parse
 from sentence_transformers import SentenceTransformer
 from sentence_transformers import __version__ as sentence_transformers_version
-from sentence_transformers import models
 from sklearn.linear_model import LogisticRegression
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.multioutput import ClassifierChain, MultiOutputClassifier
@@ -32,6 +22,7 @@ from tqdm.auto import tqdm, trange
 from transformers.utils import copy_func
 
 from . import logging
+from .compat import Dense
 from .data import SetFitDataset
 from .model_card import SetFitModelCardData, generate_model_card
 from .utils import set_docstring
@@ -44,7 +35,7 @@ MODEL_HEAD_NAME = "model_head.pkl"
 CONFIG_NAME = "config_setfit.json"
 
 
-class SetFitHead(models.Dense):
+class SetFitHead(Dense):
     """
     A SetFit head that supports multi-class classification for end-to-end training.
     Binary classification is treated as 2-class classification.
@@ -81,7 +72,7 @@ class SetFitHead(models.Dense):
         device: Optional[Union[torch.device, str]] = None,
         multitarget: bool = False,
     ) -> None:
-        super(models.Dense, self).__init__()  # init on models.Dense's parent: nn.Module
+        super(Dense, self).__init__()  # skip Dense.__init__, the linear layer is set up below
 
         if out_features == 1:
             logger.warning(
@@ -99,7 +90,7 @@ class SetFitHead(models.Dense):
         self.temperature = temperature
         self.eps = eps
         self.bias = bias
-        self._device = device or "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.multitarget = multitarget
 
         self.to(self._device)
@@ -196,8 +187,7 @@ class SetFitHead(models.Dense):
         return "SetFitHead({})".format(self.get_config_dict())
 
 
-@dataclass
-class SetFitModel(PyTorchModelHubMixin):
+class SetFitModel(ModelHubMixin):
     """A SetFit model with integration to the [Hugging Face Hub](https://huggingface.co).
 
     Example::
@@ -212,19 +202,27 @@ class SetFitModel(PyTorchModelHubMixin):
         ['positive', 'negative', 'negative']
     """
 
-    model_body: Optional[SentenceTransformer] = None
-    model_head: Optional[Union[SetFitHead, LogisticRegression]] = None
-    multi_target_strategy: Optional[str] = None
-    normalize_embeddings: bool = False
-    labels: Optional[List[str]] = None
-    model_card_data: Optional[SetFitModelCardData] = field(default_factory=SetFitModelCardData)
-    sentence_transformers_kwargs: Dict = field(default_factory=dict, repr=False)
+    def __init__(
+        self,
+        model_body: Optional[SentenceTransformer] = None,
+        model_head: Optional[Union[SetFitHead, LogisticRegression]] = None,
+        multi_target_strategy: Optional[str] = None,
+        normalize_embeddings: bool = False,
+        labels: Optional[List[str]] = None,
+        model_card_data: Optional[SetFitModelCardData] = None,
+        sentence_transformers_kwargs: Optional[Dict] = None,
+        **kwargs,
+    ) -> None:
+        super(SetFitModel, self).__init__()
+        self.model_body = model_body
+        self.model_head = model_head
+        self.multi_target_strategy = multi_target_strategy
+        self.normalize_embeddings = normalize_embeddings
+        self.labels = labels
+        self.model_card_data = model_card_data or SetFitModelCardData()
+        self.sentence_transformers_kwargs = sentence_transformers_kwargs or {}
 
-    attributes_to_save: Set[str] = field(
-        init=False, repr=False, default_factory=lambda: {"normalize_embeddings", "labels"}
-    )
-
-    def __post_init__(self):
+        self.attributes_to_save: Set[str] = {"normalize_embeddings", "labels"}
         self.model_card_data.register_model(self)
 
     @property
@@ -285,7 +283,7 @@ class SetFitModel(PyTorchModelHubMixin):
             if not end_to_end:
                 self.freeze("body")
 
-            dataloader = self._prepare_dataloader(x_train, y_train, batch_size, max_length)
+            dataloader = self._prepare_dataloader(list(x_train), list(y_train), batch_size, max_length)
             criterion = self.model_head.get_loss_fn()
             optimizer = self._prepare_optimizer(head_learning_rate, body_learning_rate, l2_weight)
             scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
@@ -315,8 +313,8 @@ class SetFitModel(PyTorchModelHubMixin):
             if not end_to_end:
                 self.unfreeze("body")
         else:  # train with sklearn
-            embeddings = self.model_body.encode(x_train, normalize_embeddings=self.normalize_embeddings)
-            self.model_head.fit(embeddings, y_train)
+            embeddings = self.model_body.encode(list(x_train), normalize_embeddings=self.normalize_embeddings)
+            self.model_head.fit(embeddings, list(y_train))
             if self.labels is None and self.multi_target_strategy is None:
                 # Try to set the labels based on the head classes, if they exist
                 # This can fail in various ways, so we catch all exceptions
@@ -478,6 +476,7 @@ class SetFitModel(PyTorchModelHubMixin):
             outputs = torch.from_numpy(outputs)
         return outputs
 
+    @torch.no_grad()
     def predict_proba(
         self,
         inputs: Union[str, List[str]],
@@ -522,6 +521,7 @@ class SetFitModel(PyTorchModelHubMixin):
         outputs = self._output_type_conversion(probs, as_numpy=as_numpy)
         return outputs[0] if is_singular else outputs
 
+    @torch.no_grad()
     def predict(
         self,
         inputs: Union[str, List[str]],
@@ -557,7 +557,7 @@ class SetFitModel(PyTorchModelHubMixin):
         is_singular = isinstance(inputs, str)
         if is_singular:
             inputs = [inputs]
-        embeddings = self.encode(inputs, batch_size=batch_size, show_progress_bar=show_progress_bar)
+        embeddings = self.encode(list(inputs), batch_size=batch_size, show_progress_bar=show_progress_bar)
         preds = self.model_head.predict(embeddings)
         # If labels are defined, we don't have multilabels & the output is not already strings, then we convert to string labels
         if (
@@ -663,7 +663,11 @@ class SetFitModel(PyTorchModelHubMixin):
         # via push_to_hub, and the path is in a temporary folder, then we only take the last two
         # directories
         model_path = Path(model_name)
-        if model_path.exists() and Path(tempfile.gettempdir()) in model_path.resolve().parents:
+        if (
+            self.model_card_data.model_id is None
+            and model_path.exists()
+            and Path(tempfile.gettempdir()) in model_path.resolve().parents
+        ):
             self.model_card_data.model_id = "/".join(model_path.parts[-2:])
 
         with open(os.path.join(path, "README.md"), "w", encoding="utf-8") as f:
@@ -751,6 +755,21 @@ class SetFitModel(PyTorchModelHubMixin):
             device = model_body._target_device
         model_body.to(device)  # put `model_body` on the target device
 
+        # huggingface_hub v1.0 removed the proxies and resume_download arguments, and its offline cache miss
+        # is an EntryNotFoundError that no longer inherits from HfHubHTTPError
+        download_kwargs = {
+            "repo_id": model_id,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "force_download": force_download,
+            "token": token,
+            "local_files_only": local_files_only,
+        }
+        if proxies is not None:
+            download_kwargs["proxies"] = proxies
+        if resume_download is not None:
+            download_kwargs["resume_download"] = resume_download
+
         # Try to load a SetFit config file
         config_file: Optional[str] = None
         if os.path.isdir(model_id):
@@ -758,18 +777,8 @@ class SetFitModel(PyTorchModelHubMixin):
                 config_file = os.path.join(model_id, CONFIG_NAME)
         else:
             try:
-                config_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=CONFIG_NAME,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-            except requests.exceptions.RequestException:
+                config_file = hf_hub_download(filename=CONFIG_NAME, **download_kwargs)
+            except (HfHubHTTPError, EntryNotFoundError):
                 pass
 
         model_kwargs = {key: value for key, value in model_kwargs.items() if value is not None}
@@ -800,18 +809,8 @@ class SetFitModel(PyTorchModelHubMixin):
                 model_head_file = None
         else:
             try:
-                model_head_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=MODEL_HEAD_NAME,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
-                    token=token,
-                    local_files_only=local_files_only,
-                )
-            except requests.exceptions.RequestException:
+                model_head_file = hf_hub_download(filename=MODEL_HEAD_NAME, **download_kwargs)
+            except (HfHubHTTPError, EntryNotFoundError):
                 logger.info(
                     f"{MODEL_HEAD_NAME} not found on HuggingFace Hub, initialising classification head with random weights."
                     " You should TRAIN this model on a downstream task to use it for predictions and inference."
@@ -876,7 +875,7 @@ class SetFitModel(PyTorchModelHubMixin):
         )
 
 
-docstring = SetFitModel.from_pretrained.__doc__
+docstring = SetFitModel.from_pretrained.__doc__ or ""
 cut_index = docstring.find("model_kwargs")
 if cut_index != -1:
     docstring = (
@@ -913,6 +912,7 @@ if cut_index != -1:
     SetFitModel.from_pretrained = set_docstring(SetFitModel.from_pretrained, docstring)
 
 SetFitModel.save_pretrained = copy_func(SetFitModel.save_pretrained)
-SetFitModel.save_pretrained.__doc__ = SetFitModel.save_pretrained.__doc__.replace(
-    "~ModelHubMixin._from_pretrained", "SetFitModel.push_to_hub"
-)
+if SetFitModel.save_pretrained.__doc__:
+    SetFitModel.save_pretrained.__doc__ = SetFitModel.save_pretrained.__doc__.replace(
+        "~ModelHubMixin._from_pretrained", "SetFitModel.push_to_hub"
+    )

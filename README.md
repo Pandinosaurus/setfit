@@ -53,7 +53,7 @@ from setfit import SetFitModel, Trainer, TrainingArguments, sample_dataset
 
 
 # Load a dataset from the Hugging Face Hub
-dataset = load_dataset("sst2")
+dataset = load_dataset("stanfordnlp/sst2")
 
 # Simulate the few-shot regime by sampling 8 examples per class
 train_dataset = sample_dataset(dataset["train"], label_column="label", num_samples=8)
@@ -69,7 +69,7 @@ model = SetFitModel.from_pretrained(
 args = TrainingArguments(
     batch_size=16,
     num_epochs=4,
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
 )

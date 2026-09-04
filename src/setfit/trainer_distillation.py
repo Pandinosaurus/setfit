@@ -3,11 +3,12 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tupl
 
 import torch
 from datasets import Dataset
-from sentence_transformers import InputExample, losses, util
+from sentence_transformers import util
 from torch import nn
 from torch.utils.data import DataLoader
 
 from . import logging
+from .compat import losses
 from .sampler import ContrastiveDistillationDataset
 from .trainer import Trainer
 from .training_args import TrainingArguments
@@ -45,7 +46,7 @@ class DistillationTrainer(Trainer):
         column_mapping (`Dict[str, str]`, *optional*):
             A mapping from the column names in the dataset to the column names expected by the model.
             The expected format is a dictionary with the following format:
-            `{"text_column_name": "text", "label_column_name: "label"}`.
+            `{"text_column_name": "text", "label_column_name": "label"}`.
     """
 
     _REQUIRED_COLUMNS = {"text"}
@@ -75,9 +76,9 @@ class DistillationTrainer(Trainer):
         self.student_model = self.model
 
     def dataset_to_parameters(self, dataset: Dataset) -> List[Iterable]:
-        return [dataset["text"]]
+        return [list(dataset["text"])]
 
-    def get_dataloader(
+    def get_dataset(
         self,
         x: List[str],
         y: Optional[Union[List[int], List[List[int]]]],
@@ -85,18 +86,16 @@ class DistillationTrainer(Trainer):
         max_pairs: int = -1,
     ) -> Tuple[DataLoader, nn.Module, int, int]:
         x_embd_student = self.teacher_model.model_body.encode(
-            x, convert_to_tensor=self.teacher_model.has_differentiable_head
+            list(x), convert_to_tensor=self.teacher_model.has_differentiable_head
         )
         cos_sim_matrix = util.cos_sim(x_embd_student, x_embd_student)
 
-        input_data = [InputExample(texts=[text]) for text in x]
         data_sampler = ContrastiveDistillationDataset(
-            input_data, cos_sim_matrix, args.num_iterations, args.sampling_strategy, max_pairs=max_pairs
+            list(x), cos_sim_matrix, args.num_iterations, args.sampling_strategy, max_pairs=max_pairs
         )
-        batch_size = min(args.embedding_batch_size, len(data_sampler))
-        dataloader = DataLoader(data_sampler, batch_size=batch_size, drop_last=False)
+        dataset = Dataset.from_list(list(data_sampler))
         loss = args.loss(self.model.model_body)
-        return dataloader, loss, batch_size, len(data_sampler)
+        return dataset, loss
 
     def train_classifier(self, x_train: List[str], args: Optional[TrainingArguments] = None) -> None:
         """
@@ -107,7 +106,8 @@ class DistillationTrainer(Trainer):
             args (`TrainingArguments`, *optional*):
                 Temporarily change the training arguments for this training call.
         """
-        y_train = self.teacher_model.predict(x_train, as_numpy=not self.student_model.has_differentiable_head)
+        with torch.no_grad():
+            y_train = self.teacher_model.predict(x_train, as_numpy=not self.student_model.has_differentiable_head)
         return super().train_classifier(x_train, y_train, args)
 
 

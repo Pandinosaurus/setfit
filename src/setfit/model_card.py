@@ -11,7 +11,7 @@ import tokenizers
 import torch
 import transformers
 from datasets import Dataset
-from huggingface_hub import CardData, DatasetFilter, ModelCard, dataset_info, list_datasets, model_info
+from huggingface_hub import CardData, ModelCard, dataset_info, list_datasets, model_info
 from huggingface_hub.repocard_data import EvalResult, eval_results_to_model_index
 from huggingface_hub.utils import yaml_dump
 from sentence_transformers import __version__ as sentence_transformers_version
@@ -37,14 +37,6 @@ class ModelCardCallback(TrainerCallback):
     def __init__(self, trainer: "Trainer") -> None:
         super().__init__()
         self.trainer = trainer
-
-        callbacks = [
-            callback
-            for callback in self.trainer.callback_handler.callbacks
-            if isinstance(callback, CodeCarbonCallback)
-        ]
-        if callbacks:
-            trainer.model.model_card_data.code_carbon_callback = callbacks[0]
 
     def on_init_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: "SetFitModel", **kwargs
@@ -80,7 +72,7 @@ class ModelCardCallback(TrainerCallback):
             "logging_strategy",
             "logging_first_step",
             "logging_steps",
-            "evaluation_strategy",
+            "eval_strategy",
             "eval_steps",
             "eval_delay",
             "save_strategy",
@@ -109,11 +101,14 @@ class ModelCardCallback(TrainerCallback):
         metrics: Dict[str, float],
         **kwargs,
     ) -> None:
+        keys = {"eval_embedding_loss", "eval_polarity_embedding_loss", "eval_aspect_embedding_loss"} & set(metrics)
+        if not keys:
+            return
         if (
             model.model_card_data.eval_lines_list
             and model.model_card_data.eval_lines_list[-1]["Step"] == state.global_step
         ):
-            model.model_card_data.eval_lines_list[-1]["Validation Loss"] = metrics["eval_embedding_loss"]
+            model.model_card_data.eval_lines_list[-1]["Validation Loss"] = metrics[keys.pop()]
         else:
             model.model_card_data.eval_lines_list.append(
                 {
@@ -121,7 +116,7 @@ class ModelCardCallback(TrainerCallback):
                     "Epoch": state.epoch,
                     "Step": state.global_step,
                     "Training Loss": "-",
-                    "Validation Loss": metrics["eval_embedding_loss"],
+                    "Validation Loss": metrics[keys.pop()],
                 }
             )
 
@@ -303,7 +298,7 @@ class SetFitModelCardData(CardData):
         samples = dataset.select(random.sample(range(len(dataset)), k=min(len(dataset), 5)))["text"]
         self.widget = [{"text": sample} for sample in samples]
 
-        samples.sort(key=len)
+        samples = sorted(list(samples), key=len)
         if samples:
             self.predict_example = samples[0]
 
@@ -409,7 +404,7 @@ class SetFitModelCardData(CardData):
             # Make sure the normalized dataset IDs match
             dataset_list = [
                 dataset
-                for dataset in list_datasets(filter=DatasetFilter(author=author, dataset_name=dataset_name))
+                for dataset in list_datasets(author=author, dataset_name=dataset_name)
                 if normalize(dataset.id) == normalize(cache_dataset_name)
             ]
             # If there's only one match, get the ID from it
@@ -437,6 +432,9 @@ class SetFitModelCardData(CardData):
     def infer_st_id(self, setfit_model_id: str) -> None:
         config_dict, _ = PretrainedConfig.get_config_dict(setfit_model_id)
         st_id = config_dict.get("_name_or_path")
+        if st_id is None:
+            # If we can't access _name_or_path, we can't infer the base model ID
+            return
         st_id_path = Path(st_id)
         # Sometimes the name_or_path ends exactly with the model_id, e.g.
         # "C:\\Users\\tom/.cache\\torch\\sentence_transformers\\BAAI_bge-small-en-v1.5\\"
@@ -519,19 +517,24 @@ class SetFitModelCardData(CardData):
         ).replace("-:|", "--|")
         super_dict["metrics_table"] = make_markdown_table(self.metric_lines).replace("-:|", "--|")
         if self.code_carbon_callback and self.code_carbon_callback.tracker:
-            emissions_data = self.code_carbon_callback.tracker._prepare_emissions_data()
-            super_dict["co2_eq_emissions"] = {
-                # * 1000 to convert kg to g
-                "emissions": float(emissions_data.emissions) * 1000,
-                "source": "codecarbon",
-                "training_type": "fine-tuning",
-                "on_cloud": emissions_data.on_cloud == "Y",
-                "cpu_model": emissions_data.cpu_model,
-                "ram_total_size": emissions_data.ram_total_size,
-                "hours_used": round(emissions_data.duration / 3600, 3),
-            }
-            if emissions_data.gpu_model:
-                super_dict["co2_eq_emissions"]["hardware_used"] = emissions_data.gpu_model
+            try:
+                emissions_data = self.code_carbon_callback.tracker._prepare_emissions_data()
+            except Exception:
+                # codecarbon v3 cannot report emissions before the tracker has been started
+                emissions_data = None
+            if emissions_data is not None:
+                super_dict["co2_eq_emissions"] = {
+                    # * 1000 to convert kg to g
+                    "emissions": float(emissions_data.emissions) * 1000,
+                    "source": "codecarbon",
+                    "training_type": "fine-tuning",
+                    "on_cloud": emissions_data.on_cloud == "Y",
+                    "cpu_model": emissions_data.cpu_model,
+                    "ram_total_size": emissions_data.ram_total_size,
+                    "hours_used": round(emissions_data.duration / 3600, 3),
+                }
+                if emissions_data.gpu_model:
+                    super_dict["co2_eq_emissions"]["hardware_used"] = emissions_data.gpu_model
         if self.dataset_id:
             super_dict["datasets"] = [self.dataset_id]
         if self.st_id:
